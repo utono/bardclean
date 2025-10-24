@@ -200,11 +200,16 @@ class DialogueProcessor:
     """
 
     # Punctuation to remove (everything except period, apostrophe, and question mark)
+    # Exclamation marks are removed mid-line but preserved at line endings
     PUNCT_PATTERN = re.compile(r"[,;:!\"\-—–]")
 
-    # Character name pattern: all caps or mixed case, short line, ends with period
-    # Matches: TROILUS., Ber., PANDARUS., AJAX., etc.
-    CHAR_NAME_PATTERN = re.compile(r'^[A-Z][A-Za-z\s]*\.$')
+    # Character name pattern: all caps or mixed case, short line, optionally ends with period
+    # Matches: TROILUS., Ber., PANDARUS., AJAX., EGEUS, THESEUS, etc.
+    CHAR_NAME_PATTERN = re.compile(r'^[A-Z][A-Za-z\s]*\.?$')
+
+    # Character name with inline dialogue pattern
+    # Matches: "YORK. Farewell, my lord;" or "Ber. Come on,"
+    CHAR_NAME_INLINE_PATTERN = re.compile(r'^([A-Z][A-Za-z\s]*\.\s+)(.+)$')
 
     # Stage direction pattern: enclosed in brackets
     STAGE_DIR_PATTERN = re.compile(r'^\[.*\]$')
@@ -227,7 +232,6 @@ class DialogueProcessor:
             'commas': 0,
             'semicolons': 0,
             'colons': 0,
-            'exclamations': 0,
             'quotes': 0,
             'dashes': 0
         }
@@ -244,11 +248,44 @@ class DialogueProcessor:
         if stripped.startswith(('ACT ', 'SCENE', 'Scene ')):
             return False
 
+        # Exclude cast list headers
+        if 'Persons' in stripped or 'Represented' in stripped or 'DRAMATIS' in stripped:
+            return False
+
         # Character names should be reasonably short (under 30 chars)
         if len(stripped) > 30:
             return False
 
         return True
+
+    def has_inline_dialogue(self, line: str) -> tuple:
+        """Check if line has character name with inline dialogue.
+
+        Returns (has_inline, char_name, dialogue) tuple.
+        If has_inline is True, char_name and dialogue are the extracted parts.
+        """
+        stripped = line.strip()
+        match = self.CHAR_NAME_INLINE_PATTERN.match(stripped)
+
+        if not match:
+            return (False, None, None)
+
+        char_name = match.group(1).strip()
+        dialogue = match.group(2).strip()
+
+        # Exclude common non-character patterns
+        if char_name.startswith(('ACT ', 'SCENE', 'Scene ')):
+            return (False, None, None)
+
+        # Character name part should be reasonably short (under 30 chars)
+        if len(char_name) > 30:
+            return (False, None, None)
+
+        # Dialogue part should exist and be substantial
+        if not dialogue or len(dialogue) < 3:
+            return (False, None, None)
+
+        return (True, char_name, dialogue)
 
     def is_stage_direction(self, line: str) -> bool:
         """Check if line is a stage direction."""
@@ -266,8 +303,12 @@ class DialogueProcessor:
             return False
 
         # All caps lines (titles, scene headers)
+        # But exclude short single-word lines (likely character names like "YORK", "HAMLET")
         if stripped.isupper() and len(stripped) > 1:
-            return True
+            # If it's a single word and reasonably short, it's likely a character name
+            if ' ' not in stripped and len(stripped) <= 20:
+                return False  # Not metadata - likely a character name
+            return True  # Longer or multi-word all-caps line is metadata
 
         # Scene/Act markers
         if stripped.startswith(('ACT ', 'SCENE', 'Scene ', 'PROLOGUE', 'EPILOGUE')):
@@ -281,7 +322,8 @@ class DialogueProcessor:
 
     def strip_punctuation(self, line: str) -> Tuple[str, bool]:
         """
-        Strip punctuation from line, preserving periods and whitespace.
+        Strip punctuation from line, preserving periods, question marks, and whitespace.
+        Exclamation marks, semicolons, colons, and double-hyphens are preserved at line endings.
 
         Punctuation is replaced with space to prevent word concatenation,
         then multiple consecutive spaces are collapsed to single space.
@@ -290,11 +332,26 @@ class DialogueProcessor:
         """
         original = line
 
+        # Check what punctuation the line ends with (preserve trailing whitespace position)
+        stripped = line.rstrip()
+        ending_punct = None
+        if stripped.endswith('!'):
+            ending_punct = '!'
+        elif stripped.endswith(';'):
+            ending_punct = ';'
+        elif stripped.endswith(':'):
+            ending_punct = ':'
+        elif stripped.endswith('--'):
+            ending_punct = '--'
+        elif stripped.endswith('—'):
+            ending_punct = '—'
+        elif stripped.endswith('–'):
+            ending_punct = '–'
+
         # Count each punctuation type before removing
         self.punctuation_removed['commas'] += line.count(',')
         self.punctuation_removed['semicolons'] += line.count(';')
         self.punctuation_removed['colons'] += line.count(':')
-        self.punctuation_removed['exclamations'] += line.count('!')
         self.punctuation_removed['quotes'] += line.count('"')
         self.punctuation_removed['dashes'] += line.count('-') + line.count('—') + line.count('–')
 
@@ -304,6 +361,14 @@ class DialogueProcessor:
         # Collapse multiple consecutive spaces to single space
         # This handles cases like "hello ! world" → "hello  world" → "hello world"
         modified = re.sub(r' {2,}', ' ', modified)
+
+        # If original line ended with special punctuation, restore it at the end
+        if ending_punct:
+            # Remove the space(s) that replaced the final punctuation and add it back
+            modified = modified.rstrip() + ending_punct
+            # Preserve original trailing whitespace
+            trailing_whitespace = line[len(line.rstrip()):]
+            modified += trailing_whitespace
 
         return modified, (original != modified)
 
@@ -429,11 +494,37 @@ class DialogueProcessor:
         """Process a single line based on current state."""
         self.lines_processed += 1
 
-        # Stage directions: never modify
+        # Stage directions: never modify, but stay in current dialogue state
+        # Stage directions can appear within a character's speech
         if self.is_stage_direction(line):
+            self.non_dialogue_lines_skipped += 1
+            return line
+
+        # Metadata/headers: check BEFORE character names to avoid false matches
+        # (e.g., "THESEUS, Duke of Athens" in cast lists)
+        if self.is_metadata_or_header(line):
             self.in_dialogue = False
             self.non_dialogue_lines_skipped += 1
             return line
+
+        # Check for inline dialogue (character name + dialogue on same line)
+        has_inline, char_name, dialogue = self.has_inline_dialogue(line)
+        if has_inline:
+            self.in_dialogue = True
+            self.dialogue_lines_processed += 1
+            # Process just the dialogue part
+            modified_dialogue, was_modified = self.strip_punctuation(dialogue)
+            if was_modified:
+                self.lines_modified += 1
+                # Reconstruct line with character name + processed dialogue
+                # Preserve original line ending (newline)
+                line_ending = line[len(line.rstrip()):]
+                reconstructed = f"{char_name} {modified_dialogue}{line_ending}"
+                if self.dry_run and len(self.preview_changes) < 50:
+                    self.preview_changes.append((self.lines_processed, line.strip(), reconstructed.strip()))
+                return reconstructed
+            else:
+                return line
 
         # Character names: mark start of dialogue
         if self.is_character_name(line):
@@ -441,16 +532,11 @@ class DialogueProcessor:
             self.non_dialogue_lines_skipped += 1  # Character names are not dialogue
             return line
 
-        # Blank lines: end dialogue state
+        # Blank lines: don't change dialogue state
+        # Blank lines can appear within speeches (after stage directions) or between speakers
+        # Let character names and metadata/headers handle state transitions
         if self.is_blank_or_whitespace(line):
-            self.in_dialogue = False
             return line  # Don't count blank lines
-
-        # Metadata/headers: never modify
-        if self.is_metadata_or_header(line):
-            self.in_dialogue = False
-            self.non_dialogue_lines_skipped += 1
-            return line
 
         # If we're in dialogue mode, strip punctuation
         if self.in_dialogue:
@@ -571,29 +657,35 @@ class DialogueProcessor:
             processed_line = self.process_line(line)
             processed_lines.append(processed_line)
 
+        # Determine output path
+        # If source is in unclean-gutenberg, write to gutenberg with -unclean suffix removed
+        output_path = self.filepath
+        if 'unclean-gutenberg' in str(self.filepath):
+            # Create output directory path
+            output_dir = Path.home() / "utono" / "literature" / "shakespeare-william" / "gutenberg"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Remove -unclean suffix from filename
+            filename = self.filepath.name
+            if filename.endswith('-unclean.txt'):
+                output_filename = filename.replace('-unclean.txt', '.txt')
+            else:
+                output_filename = filename
+
+            output_path = output_dir / output_filename
+
+            if not self.quiet and not self.dry_run:
+                print(f"Output: {output_path}")
+
         # Write modified content (skip in dry-run mode)
         if not self.dry_run:
             try:
-                with open(self.filepath, 'w', encoding='utf-8') as f:
+                with open(output_path, 'w', encoding='utf-8') as f:
                     f.writelines(processed_lines)
             except Exception as e:
                 if not self.quiet:
-                    print(f"Error writing {self.filepath}: {e}")
-                # Restore original permissions even on error
-                if was_readonly and original_mode:
-                    try:
-                        os.chmod(self.filepath, original_mode)
-                    except:
-                        pass
+                    print(f"Error writing {output_path}: {e}")
                 return False
-
-        # Restore original permissions if file was read-only (skip in dry-run)
-        if was_readonly and original_mode and not self.dry_run:
-            try:
-                os.chmod(self.filepath, original_mode)
-            except Exception as e:
-                if not self.quiet:
-                    print(f"Warning: Could not restore original permissions: {e}")
 
         # Report results
         if not self.quiet:
@@ -653,7 +745,6 @@ class DialogueProcessor:
             print(f"  Commas: {self.punctuation_removed['commas']}")
             print(f"  Semicolons: {self.punctuation_removed['semicolons']}")
             print(f"  Colons: {self.punctuation_removed['colons']}")
-            print(f"  Exclamations: {self.punctuation_removed['exclamations']}")
             print(f"  Quotes: {self.punctuation_removed['quotes']}")
             print(f"  Dashes: {self.punctuation_removed['dashes']}")
 
@@ -872,7 +963,7 @@ def select_files_with_fzf(search_dir: str = None) -> List[str]:
 def main():
     """Main entry point."""
     # Default directory for Shakespeare texts
-    default_dir = Path.home() / "utono" / "literature" / "shakespeare-william" / "gutenberg"
+    default_dir = Path.home() / "utono" / "literature" / "shakespeare-william" / "unclean-gutenberg"
 
     # Parse command-line arguments
     parser = argparse.ArgumentParser(
@@ -952,7 +1043,7 @@ Default text directory: {default_dir}
     parser.add_argument(
         '--no-backup',
         action='store_true',
-        help='Skip backup creation (use with caution - for agent workflows only)'
+        help='(Deprecated) Backups are not created by default - originals are in unclean-gutenberg/'
     )
 
     # Output control flags (mutually exclusive)
@@ -1119,7 +1210,8 @@ Default text directory: {default_dir}
             continue
 
         # Process the file
-        create_backup = not args.no_backup
+        # No backup needed - originals are in unclean-gutenberg directory
+        create_backup = False
         success = processor.process_file(create_backup=create_backup)
 
         # Create result object
